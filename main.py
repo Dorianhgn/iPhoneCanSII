@@ -131,6 +131,10 @@ class IOSRobotPerception:
             depth_m = self.session.get_depth_frame()
             current_time = time.time()
 
+            # Danger global: si une zone de profondeur < 1m est détectée
+            valid_depth = depth_m[(depth_m > 0.01) & (depth_m < 10.0)]
+            danger_depth = bool(valid_depth.size > 0 and np.any(valid_depth < 1.0))
+
             # 2. Tracking avec le tracker configuré
             # persist=True : Garde la mémoire des objets entre les frames
             results = self.model.track(
@@ -211,6 +215,11 @@ class IOSRobotPerception:
             mode_text = f"Mode: {self.model_name.replace('.pt', '').upper()} + {self.tracker_name}"
             cv2.putText(display_frame, mode_text, (10, 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            # Croix rouge si danger détecté, même sans détection YOLO
+            if danger_depth:
+                cv2.line(display_frame, (0, 0), (rgb.shape[1], rgb.shape[0]), (0, 0, 255), 5)
+                cv2.line(display_frame, (rgb.shape[1], 0), (0, rgb.shape[0]), (0, 0, 255), 5)
             
             cv2.imshow("iPhone 17 Pro - Robot Vision", display_frame)
 
