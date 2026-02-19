@@ -219,3 +219,10 @@ __marimo__/
 *.pt
 *.pth 
 *.ckpt
+
+logs/
+*.ply
+*.png
+*.jpg
+*.jpeg
+*.gif
