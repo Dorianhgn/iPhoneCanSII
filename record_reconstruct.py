@@ -582,9 +582,14 @@ class Record3DRecorder:
                 f.write(f"Points bruts            : {stats.get('n_raw_points', 0):,}\n")
                 f.write(f"Points après voxel      : {stats.get('n_voxel_points', 0):,}\n")
                 f.write(f"Points finaux           : {stats.get('n_final_points', 0):,}\n")
-            f.write(f"Temps reconstruction    : {t_recon:.2f}s\n\n")
+            f.write(f"Temps reconstruction    : {t_recon:.2f}s\n")
+            fps_recon = stats.get('n_frames_used', 0) / t_recon if t_recon > 0 else 0
+            f.write(f"FPS reconstruction      : {fps_recon:.2f} frames/s\n\n")
             f.write(f"--- Normales ---\n")
-            f.write(f"Temps normales          : {t_normals:.2f}s\n\n")
+            n_pts = stats.get('n_final_points', 0)
+            pts_per_sec = n_pts / t_normals if t_normals > 0 else 0
+            f.write(f"Temps normales          : {t_normals:.2f}s\n")
+            f.write(f"Points/s normales       : {pts_per_sec:,.0f} pts/s\n\n")
             f.write(f"--- Total ---\n")
             f.write(f"Temps total pipeline    : {t_total:.2f}s\n")
 
@@ -630,7 +635,69 @@ class Record3DRecorder:
 
         print(f"\n✅ Pipeline terminé. Voir : {log_dir}/")
         print(f"   → Visualiser : python view_ply.py {ply_path}")
+    # ── Sauvegarde / chargement d'un recording brut (pour benchmark) ────────────
 
+    def save_raw_recording(self, path):
+        """
+        Sauvegarde les frames enregistrées dans un fichier .npz pour réutilisation.
+        Utile pour lancer des benchmarks reproductibles sans l'iPhone connecté.
+        """
+        frames = self.recorded_frames
+        if not frames:
+            print("❌ Aucune frame enregistrée.")
+            return
+
+        depths      = np.array([f['depth']     for f in frames], dtype=np.float32)
+        rgbs        = np.array([f['rgb']       for f in frames], dtype=np.uint8)
+        intrinsics  = np.array([f['intrinsic'] for f in frames], dtype=np.float64)
+        has_conf    = frames[0]['confidence'] is not None
+        confidences = np.array(
+            [f['confidence'] if f['confidence'] is not None
+             else np.zeros(frames[0]['depth'].shape, dtype=np.uint8)
+             for f in frames], dtype=np.uint8
+        )
+        poses = np.array(
+            [[f['pose']['qx'], f['pose']['qy'], f['pose']['qz'], f['pose']['qw'],
+              f['pose']['tx'], f['pose']['ty'], f['pose']['tz']]
+             for f in frames], dtype=np.float64
+        )
+
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        np.savez_compressed(
+            path,
+            depths=depths, rgbs=rgbs, intrinsics=intrinsics,
+            confidences=confidences, has_confidence=np.array([has_conf]),
+            poses=poses,
+        )
+        print(f"💾 Recording brut sauvegardé → {path}  ({len(frames)} frames)")
+
+    @staticmethod
+    def load_raw_recording(path):
+        """
+        Charge un recording sauvegardé (.npz) et retourne une liste de dicts
+        au même format que recorded_frames.
+        """
+        data     = np.load(path, allow_pickle=False)
+        n        = len(data['depths'])
+        has_conf = bool(data['has_confidence'][0])
+        poses    = data['poses']   # shape (N, 7): qx qy qz qw tx ty tz
+
+        frames = []
+        for i in range(n):
+            frames.append({
+                'depth':      data['depths'][i],
+                'rgb':        data['rgbs'][i],
+                'intrinsic':  data['intrinsics'][i],
+                'confidence': data['confidences'][i] if has_conf else None,
+                'pose': {
+                    'qx': float(poses[i, 0]), 'qy': float(poses[i, 1]),
+                    'qz': float(poses[i, 2]), 'qw': float(poses[i, 3]),
+                    'tx': float(poses[i, 4]), 'ty': float(poses[i, 5]),
+                    'tz': float(poses[i, 6]),
+                },
+            })
+        print(f"\u2705 Recording chargé : {n} frames depuis {path}")
+        return frames
     # ── Boucle principale ─────────────────────────────────────────────────────
 
     def run(self):

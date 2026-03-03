@@ -1,0 +1,81 @@
+{
+  "_comment": "Benchmark config – toutes les clés 'configs[].key' overrident les globals de record_reconstruct.py",
+
+  "recording_path": null,
+  "_recording_path_comment": "null = capture depuis iPhone. Sinon chemin vers un .npz sauvegardé (ex: 'recordings/scan.npz'). Si le fichier n'existe pas encore, la capture le crée automatiquement.",
+
+  "save_ply": false,
+  "_save_ply_comment": "true = sauvegarde un .ply par config dans benchmarks/<timestamp>/<name>/",
+
+  "output_dir": "benchmarks",
+
+  "configs": [
+
+    {
+      "name": "fast_5mm",
+      "_comment": "Accumulation rapide, voxel 5mm – baseline légère",
+      "USE_TSDF":        false,
+      "FRAME_SKIP":      1,
+      "MIN_TRAVEL_DIST": 0.005,
+      "SUBSAMPLE":       2,
+      "VOXEL_SIZE":      0.005,
+      "MAX_DEPTH":       4.0,
+      "CONFIDENCE_MIN":  1,
+      "OUTLIER_NB":      20,
+      "OUTLIER_STD":     2.0,
+      "NORMAL_KNN":      30,
+      "NORMAL_RADIUS":   0.05
+    },
+
+    {
+      "name": "fast_1cm",
+      "_comment": "Accumulation rapide, voxel 1cm – absorbant le jitter ARKit",
+      "USE_TSDF":        false,
+      "FRAME_SKIP":      1,
+      "MIN_TRAVEL_DIST": 0.01,
+      "SUBSAMPLE":       2,
+      "VOXEL_SIZE":      0.01,
+      "MAX_DEPTH":       4.0,
+      "CONFIDENCE_MIN":  1,
+      "OUTLIER_NB":      20,
+      "OUTLIER_STD":     2.0,
+      "NORMAL_KNN":      30,
+      "NORMAL_RADIUS":   0.05
+    },
+
+    {
+      "name": "tsdf_5mm_cpu",
+      "_comment": "TSDF CPU ScalableTSDFVolume, 5mm – référence qualité",
+      "USE_TSDF":           true,
+      "USE_GPU":            false,
+      "FRAME_SKIP":         1,
+      "MIN_TRAVEL_DIST":    0.005,
+      "TSDF_VOXEL_LENGTH":  0.005,
+      "TSDF_SDF_TRUNC":     0.04,
+      "MAX_DEPTH":          4.0,
+      "CONFIDENCE_MIN":     1,
+      "OUTLIER_NB":         20,
+      "OUTLIER_STD":        2.0,
+      "NORMAL_KNN":         30,
+      "NORMAL_RADIUS":      0.05
+    },
+
+    {
+      "name": "tsdf_8mm_cpu",
+      "_comment": "TSDF CPU plus léger, 8mm – bon compromis vitesse/qualité",
+      "USE_TSDF":           true,
+      "USE_GPU":            false,
+      "FRAME_SKIP":         2,
+      "MIN_TRAVEL_DIST":    0.01,
+      "TSDF_VOXEL_LENGTH":  0.008,
+      "TSDF_SDF_TRUNC":     0.06,
+      "MAX_DEPTH":          4.0,
+      "CONFIDENCE_MIN":     1,
+      "OUTLIER_NB":         20,
+      "OUTLIER_STD":        2.0,
+      "NORMAL_KNN":         30,
+      "NORMAL_RADIUS":      0.05
+    }
+
+  ]
+}
