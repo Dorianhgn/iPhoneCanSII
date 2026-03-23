@@ -1,4 +1,34 @@
+"""
+Tri-plane Probe: Outil d'analyse géométrique pour enregistrements Record3D (.npz).
+
+Ce script projette une accumulation de nuages de points 3D sur trois plans orthogonaux (Top, Front, Side)
+pour évaluer la densité de surface et la couverture spatiale.
+
+Usage:
+    python triplane_probe.py <recording.npz> [options]
+
+Arguments:
+    recording           : Chemin vers le fichier .npz (capturé via --save-npz dans record_reconstruct.py).
+
+Options:
+    --n-frames N        : Nombre de frames à accumuler autour de l'index de départ (défaut: 10).
+    --start-index I     : Index de la frame pivot (défaut: 0).
+    --res R             : Résolution de la grille des tri-planes (défaut: 128x128).
+    --extent E          : Taille de la boîte englobante en mètres (défaut: 4.0m, centré sur la frame pivot).
+    --past-mode         : Si activé, accumule de [start-index - N : start-index]. 
+                          Sinon, accumule de [start-index : start-index + N] (futur).
+    --skip-normals      : Désactive l'estimation des normales (accélère le rendu, enlève l'overlay rouge).
+    --no-interactive    : Désactive le mode GUI interactif (affiche juste un snapshot statique).
+
+Contrôles (Mode Interactif) :
+    LEFT / RIGHT        : Index de départ -1 / +1.
+    SHIFT + LEFT/RIGHT  : Index de départ -10 / +10.
+    UP / DOWN           : Nombre de frames accumulées -1 / +1.
+    SHIFT + UP/DOWN     : Nombre de frames accumulées -5 / +5.
+    SPACE               : Alterne entre le mode Mono (Hauteur + Overlay Rouge) et le mode RGB.
+"""
 import argparse
+import time
 import numpy as np
 import open3d as o3d
 import matplotlib.pyplot as plt
@@ -13,6 +43,8 @@ START_INDEX = 0
 
 NORMAL_ANGLE_DEG = 30.0
 CONFIDENCE_MIN = 1
+NORMAL_VOXEL_SIZE = 0.05
+NORMAL_PROPAGATE_RADIUS = 0.1
 
 
 def map_to_pixels(coords, half_extent, res):
@@ -144,18 +176,18 @@ def project_triplanes(points, colors, steep_mask, res, extent):
     )
 
     return {
-        "plane_XY": plane_xy,
-        "plane_YZ": plane_yz,
-        "plane_ZX": plane_zx,
-        "plane_XY_rgb": np.clip(plane_xy_rgb, 0.0, 1.0),
-        "plane_YZ_rgb": np.clip(plane_yz_rgb, 0.0, 1.0),
-        "plane_ZX_rgb": np.clip(plane_zx_rgb, 0.0, 1.0),
-        "occ_XY": plane_xy_occ,
-        "occ_YZ": plane_yz_occ,
-        "occ_ZX": plane_zx_occ,
-        "overlay_XY": overlay_xy,
-        "overlay_YZ": overlay_yz,
-        "overlay_ZX": overlay_zx,
+        "plane_front": plane_xy,
+        "plane_side": plane_yz,
+        "plane_top": plane_zx,
+        "plane_front_rgb": np.clip(plane_xy_rgb, 0.0, 1.0),
+        "plane_side_rgb": np.clip(plane_yz_rgb, 0.0, 1.0),
+        "plane_top_rgb": np.clip(plane_zx_rgb, 0.0, 1.0),
+        "occ_front": plane_xy_occ,
+        "occ_side": plane_yz_occ,
+        "occ_top": plane_zx_occ,
+        "overlay_front": overlay_xy,
+        "overlay_side": overlay_yz,
+        "overlay_top": overlay_zx,
     }
 
 
@@ -171,12 +203,34 @@ def coverage_percent(occupied):
 
 def compute_plane_metrics(result):
     metrics = {}
-    for suffix in ("XY", "YZ", "ZX"):
+    for suffix in ("front", "side", "top"):
         occ = result[f"occ_{suffix}"]
         count = int(np.count_nonzero(occ))
         cov = coverage_percent(occ)
         metrics[suffix] = (count, cov)
     return metrics
+
+
+def resolve_window_indices(total_frames, start_index, n_frames, past_mode=False):
+    """Return a safe list of frame indices for the requested temporal window."""
+    if total_frames <= 0:
+        return []
+
+    start_index = int(np.clip(start_index, 0, total_frames - 1))
+    n_frames = max(1, int(n_frames))
+
+    if past_mode:
+        # Requested: [start_index - n_frames : start_index + 1], anchor at present.
+        begin = max(0, start_index - n_frames)
+        end_exclusive = min(total_frames, start_index + 1)
+    else:
+        # Current mode: [start_index : start_index + n_frames], anchor at first frame.
+        begin = start_index
+        end_exclusive = min(total_frames, start_index + n_frames)
+
+    if begin >= end_exclusive:
+        return []
+    return list(range(begin, end_exclusive))
 
 
 def frame_points_in_frame0(frame, t0_inv):
@@ -240,25 +294,23 @@ def frame_points_in_frame0(frame, t0_inv):
     return pts_frame0.astype(np.float32), colors.astype(np.float32)
 
 
-def accumulate_points(frames, n_frames, start_index=0):
-    if start_index < 0:
-        start_index = 0
-    if start_index >= len(frames):
+def accumulate_points(frames, n_frames, start_index=0, past_mode=False):
+    frame_indices = resolve_window_indices(
+        total_frames=len(frames),
+        start_index=start_index,
+        n_frames=n_frames,
+        past_mode=past_mode,
+    )
+
+    if not frame_indices:
         return (
             np.empty((0, 3), dtype=np.float32),
             np.empty((0, 3), dtype=np.float32),
             np.array([0.0, 1.0, 0.0], dtype=np.float32),
         )
 
-    n = min(n_frames, len(frames) - start_index)
-    if n == 0:
-        return (
-            np.empty((0, 3), dtype=np.float32),
-            np.empty((0, 3), dtype=np.float32),
-            np.array([0.0, 1.0, 0.0], dtype=np.float32),
-        )
-
-    p0 = frames[start_index]["pose"]
+    anchor_idx = frame_indices[-1] if past_mode else frame_indices[0]
+    p0 = frames[anchor_idx]["pose"]
     t0 = pose_to_matrix(
         p0["qx"], p0["qy"], p0["qz"], p0["qw"], p0["tx"], p0["ty"], p0["tz"]
     )
@@ -270,7 +322,7 @@ def accumulate_points(frames, n_frames, start_index=0):
 
     chunks = []
     color_chunks = []
-    for i in range(start_index, start_index + n):
+    for i in frame_indices:
         pts, cols = frame_points_in_frame0(frames[i], t0_inv)
         if pts.shape[0] > 0:
             chunks.append(pts)
@@ -286,33 +338,64 @@ def accumulate_points(frames, n_frames, start_index=0):
     return np.vstack(chunks), np.vstack(color_chunks), up_frame0.astype(np.float32)
 
 
-def compute_steep_mask(points, vertical_axis):
-    if points.shape[0] < 8:
-        return np.zeros(points.shape[0], dtype=bool)
+def compute_steep_mask(points, vertical_axis, skip_normals=False):
+    t0 = time.perf_counter()
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+    if skip_normals or points.shape[0] < 8:
+        return np.zeros(points.shape[0], dtype=bool), (time.perf_counter() - t0) * 1000.0
 
-    pcd.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.08, max_nn=30)
+    pcd_full = o3d.geometry.PointCloud()
+    pcd_full.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+
+    pcd_ds = pcd_full.voxel_down_sample(NORMAL_VOXEL_SIZE)
+    ds_points = np.asarray(pcd_ds.points)
+    if ds_points.shape[0] == 0:
+        return np.zeros(points.shape[0], dtype=bool), (time.perf_counter() - t0) * 1000.0
+
+    pcd_ds.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.12, max_nn=30)
     )
-    normals = np.asarray(pcd.normals)
-    if normals.shape[0] == 0:
-        return np.zeros(points.shape[0], dtype=bool)
+    ds_normals = np.asarray(pcd_ds.normals)
+    if ds_normals.shape[0] == 0:
+        return np.zeros(points.shape[0], dtype=bool), (time.perf_counter() - t0) * 1000.0
 
     vertical = vertical_axis.astype(np.float64)
     vertical /= np.linalg.norm(vertical) + 1e-12
 
-    cos_abs = np.abs(normals @ vertical)
+    cos_abs_ds = np.abs(ds_normals @ vertical)
     threshold = np.cos(np.deg2rad(NORMAL_ANGLE_DEG))
-    return cos_abs < threshold
+    steep_ds = cos_abs_ds < threshold
+
+    steep_full = np.zeros(points.shape[0], dtype=bool)
+    max_radius2 = NORMAL_PROPAGATE_RADIUS * NORMAL_PROPAGATE_RADIUS
+
+    # Fast vectorized nearest-neighbor propagation via Open3D tensor NNS.
+    try:
+        ds_tensor = o3d.core.Tensor(ds_points.astype(np.float32))
+        q_tensor = o3d.core.Tensor(points.astype(np.float32))
+        nns = o3d.core.nns.NearestNeighborSearch(ds_tensor)
+        nns.knn_index()
+        indices, dists2 = nns.knn_search(q_tensor, 1)
+        nn_idx = indices.numpy().reshape(-1)
+        nn_dist2 = dists2.numpy().reshape(-1)
+        valid = np.isfinite(nn_dist2) & (nn_dist2 <= max_radius2)
+        steep_full[valid] = steep_ds[nn_idx[valid]]
+    except Exception:
+        # Fallback when tensor NNS is unavailable.
+        kdtree = o3d.geometry.KDTreeFlann(pcd_ds)
+        for i, p in enumerate(points):
+            k, idx, d2 = kdtree.search_knn_vector_3d(p.astype(np.float64), 1)
+            if k > 0 and d2[0] <= max_radius2:
+                steep_full[i] = steep_ds[idx[0]]
+
+    return steep_full, (time.perf_counter() - t0) * 1000.0
 
 
 def draw_triplanes(axes, result, res, render_mode="mono_red"):
     ordered = [
-        ("plane_XY", "occ_XY", "overlay_XY", "plane_XY (Top: Z max)"),
-        ("plane_YZ", "occ_YZ", "overlay_YZ", "plane_YZ (Side: X min)"),
-        ("plane_ZX", "occ_ZX", "overlay_ZX", "plane_ZX (Front: Y max)"),
+        ("plane_top", "occ_top", "overlay_top", "Top View (ZX)"),
+        ("plane_front", "occ_front", "overlay_front", "Front View (XY)"),
+        ("plane_side", "occ_side", "overlay_side", "Side View (YZ)"),
     ]
 
     for ax, (plane_key, occ_key, overlay_key, name) in zip(axes, ordered):
@@ -338,7 +421,7 @@ def show_triplanes(result, res):
     plt.tight_layout()
 
 
-def density_series(frames, max_n, res, extent, start_index=0):
+def density_series(frames, max_n, res, extent, start_index=0, past_mode=False):
     if start_index < 0:
         start_index = 0
     if start_index >= len(frames):
@@ -349,56 +432,101 @@ def density_series(frames, max_n, res, extent, start_index=0):
     ys = []
 
     for n in xs:
-        pts, cols, vertical = accumulate_points(frames, n, start_index=start_index)
+        pts, cols, vertical = accumulate_points(
+            frames,
+            n,
+            start_index=start_index,
+            past_mode=past_mode,
+        )
         if pts.shape[0] == 0:
             ys.append(0.0)
             continue
 
-        steep = compute_steep_mask(pts, vertical)
+        # Density does not depend on normal-based overlay.
+        steep = np.zeros(pts.shape[0], dtype=bool)
         tri = project_triplanes(pts, cols, steep, res=res, extent=extent)
 
-        cov_xy = coverage_percent(tri["occ_XY"])
-        cov_yz = coverage_percent(tri["occ_YZ"])
-        cov_zx = coverage_percent(tri["occ_ZX"])
-        ys.append((cov_xy + cov_yz + cov_zx) / 3.0)
+        cov_front = coverage_percent(tri["occ_front"])
+        cov_side = coverage_percent(tri["occ_side"])
+        cov_top = coverage_percent(tri["occ_top"])
+        ys.append((cov_front + cov_side + cov_top) / 3.0)
 
     return xs, ys
 
 
-def draw_density_curve(ax, xs, ys, n_frames, start_index):
+def draw_density_curve(ax, xs, ys, n_frames, start_index, past_mode=False):
     ax.clear()
     ax.plot(xs, ys, marker="o", linewidth=2)
     ax.set_xlabel("N_FRAMES accumulees")
     ax.set_ylabel("Densite pixels non-nuls (%)")
+    mode = "past" if past_mode else "future"
     ax.set_title(
-        f"Densite moyenne des Tri-planes vs N_FRAMES (start={start_index}, window={n_frames})"
+        f"Densite moyenne des Tri-planes vs N_FRAMES (start={start_index}, window={n_frames}, mode={mode})"
     )
     ax.grid(True, alpha=0.3)
 
 
-def density_curve(frames, max_n, res, extent, start_index=0):
-    xs, ys = density_series(frames, max_n, res, extent, start_index=start_index)
+def density_curve(frames, max_n, res, extent, start_index=0, past_mode=False):
+    xs, ys = density_series(
+        frames,
+        max_n,
+        res,
+        extent,
+        start_index=start_index,
+        past_mode=past_mode,
+    )
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
-    draw_density_curve(ax, xs, ys, max_n, start_index)
+    draw_density_curve(ax, xs, ys, max_n, start_index, past_mode=past_mode)
     plt.tight_layout()
 
 
-def compute_probe(frames, start_index, n_frames, res, extent):
-    points, colors, vertical = accumulate_points(frames, n_frames, start_index=start_index)
+def compute_probe(
+    frames,
+    start_index,
+    n_frames,
+    res,
+    extent,
+    skip_normals=False,
+    past_mode=False,
+):
+    points, colors, vertical = accumulate_points(
+        frames,
+        n_frames,
+        start_index=start_index,
+        past_mode=past_mode,
+    )
     if points.shape[0] == 0:
         return None
 
-    steep_mask = compute_steep_mask(points, vertical)
+    steep_mask, normals_ms = compute_steep_mask(
+        points,
+        vertical,
+        skip_normals=skip_normals,
+    )
+    t_scatter0 = time.perf_counter()
     tri = project_triplanes(points, colors, steep_mask, res=res, extent=extent)
+    scatter_ms = (time.perf_counter() - t_scatter0) * 1000.0
     return {
         "tri": tri,
         "metrics": compute_plane_metrics(tri),
         "n_points": int(points.shape[0]),
+        "timing_ms": {
+            "scatter": scatter_ms,
+            "normals": normals_ms,
+        },
     }
 
 
-def interactive_viewer(frames, start_index, n_frames, res, extent):
+def interactive_viewer(
+    frames,
+    start_index,
+    n_frames,
+    res,
+    extent,
+    skip_normals=False,
+    past_mode=False,
+):
     state = {
         "start": max(0, min(start_index, len(frames) - 1)),
         "n": max(1, n_frames),
@@ -409,7 +537,16 @@ def interactive_viewer(frames, start_index, n_frames, res, extent):
     fig_curve, ax_curve = plt.subplots(1, 1, figsize=(8, 5))
 
     def redraw():
-        probe = compute_probe(frames, state["start"], state["n"], res, extent)
+        t_plot0 = time.perf_counter()
+        probe = compute_probe(
+            frames,
+            state["start"],
+            state["n"],
+            res,
+            extent,
+            skip_normals=skip_normals,
+            past_mode=past_mode,
+        )
         if probe is None:
             for ax in axes:
                 ax.clear()
@@ -426,8 +563,22 @@ def interactive_viewer(frames, start_index, n_frames, res, extent):
                 f"points={probe['n_points']}  |  mode={state['render_mode']}"
             )
 
-        xs, ys = density_series(frames, state["n"], res, extent, start_index=state["start"])
-        draw_density_curve(ax_curve, xs, ys, state["n"], state["start"])
+        xs, ys = density_series(
+            frames,
+            state["n"],
+            res,
+            extent,
+            start_index=state["start"],
+            past_mode=past_mode,
+        )
+        draw_density_curve(
+            ax_curve,
+            xs,
+            ys,
+            state["n"],
+            state["start"],
+            past_mode=past_mode,
+        )
         fig_curve.suptitle(
             "LEFT/RIGHT: start +-1 | SHIFT+LEFT/RIGHT: start +-10 | "
             "UP/DOWN: N +-1 | SHIFT+UP/DOWN: N +-5 | SPACE: color mode"
@@ -435,6 +586,13 @@ def interactive_viewer(frames, start_index, n_frames, res, extent):
 
         fig_planes.canvas.draw_idle()
         fig_curve.canvas.draw_idle()
+        plot_ms = (time.perf_counter() - t_plot0) * 1000.0
+
+        scatter_ms = probe["timing_ms"]["scatter"] if probe is not None else 0.0
+        normals_ms = probe["timing_ms"]["normals"] if probe is not None else 0.0
+        print(
+            f"[timing] scatter={scatter_ms:.1f} ms | normals={normals_ms:.1f} ms | plot={plot_ms:.1f} ms"
+        )
 
     def on_key(event):
         key = event.key
@@ -516,6 +674,18 @@ def main():
         action="store_true",
         help="Disable keyboard interactive viewer (left/right/up/down).",
     )
+    parser.add_argument(
+        "--skip-normals",
+        action="store_true",
+        default=False,
+        help="Disable normal estimation and red overlay for faster iteration.",
+    )
+    parser.add_argument(
+        "--past-mode",
+        action="store_true",
+        default=False,
+        help="Use past accumulation window [start_index - n_frames : start_index + 1] anchored at present.",
+    )
     args = parser.parse_args()
 
     frames = Record3DRecorder.load_raw_recording(args.recording)
@@ -525,11 +695,15 @@ def main():
 
     max_start = max(0, len(frames) - 1)
     start_index = int(np.clip(args.start_index, 0, max_start))
-    n_used = min(args.n_frames, len(frames) - start_index)
+    if args.past_mode:
+        n_available = start_index + 1
+    else:
+        n_available = len(frames) - start_index
+    n_used = min(args.n_frames, n_available)
     if n_used < args.n_frames:
         print(
             f"Requested {args.n_frames} frames from start={start_index}, "
-            f"only {n_used} available in range."
+            f"only {n_used} available in range (past_mode={args.past_mode})."
         )
 
     if not args.no_interactive:
@@ -539,22 +713,40 @@ def main():
             n_frames=max(1, n_used),
             res=args.res,
             extent=args.extent,
+            skip_normals=args.skip_normals,
+            past_mode=args.past_mode,
         )
         return
 
+    t_plot0 = time.perf_counter()
     probe = compute_probe(
         frames,
         start_index=start_index,
         n_frames=max(1, n_used),
         res=args.res,
         extent=args.extent,
+        skip_normals=args.skip_normals,
+        past_mode=args.past_mode,
     )
     if probe is None:
         print("No valid 3D points extracted from selected frames.")
         return
 
     show_triplanes(probe["tri"], args.res)
-    density_curve(frames, n_used, args.res, args.extent, start_index=start_index)
+    density_curve(
+        frames,
+        n_used,
+        args.res,
+        args.extent,
+        start_index=start_index,
+        past_mode=args.past_mode,
+    )
+    plot_ms = (time.perf_counter() - t_plot0) * 1000.0
+    print(
+        f"[timing] scatter={probe['timing_ms']['scatter']:.1f} ms | "
+        f"normals={probe['timing_ms']['normals']:.1f} ms | "
+        f"plot={plot_ms:.1f} ms"
+    )
     plt.show()
 
 
