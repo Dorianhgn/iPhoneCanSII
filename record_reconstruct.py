@@ -19,6 +19,7 @@ Usage :
     1. Branche l'iPhone en USB
     2. Record3D app → Settings → "USB Streaming mode" activé
     3. Lance : python record_reconstruct.py
+    (optionnel) : python record_reconstruct.py --save-npz
     4. Appuie sur ⏺ dans l'app pour démarrer le flux
 
 Contrôles :
@@ -29,8 +30,10 @@ Sorties (dans logs/<datetime>/) :
     - reconstructed.ply   : nuage de points avec normales
     - config.txt          : hyperparamètres utilisés
     - performance.log     : métriques de performance
+    - scan.npz            : recording brut (si --save-npz activé)
 """
 
+import argparse
 import threading
 import time
 import os
@@ -76,7 +79,7 @@ TSDF_SDF_TRUNC    = 0.04    # Troncature SDF (m). Règle : 4-8× TSDF_VOXEL_LENG
 TSDF_BLOCK_COUNT  = 50000   # Nb blocs pré-alloués (GPU uniquement).
                             # 50000 ≈ pièce standard. Augmenter pour grandes scènes.
 
-MAX_DEPTH         = 4.0     # Profondeur max (m). 2.0=bureau, 4.0=pièce, 5+=extérieur.
+MAX_DEPTH         = 6.0     # Profondeur max (m). 2.0=bureau, 4.0=pièce, 5+=extérieur.
 CONFIDENCE_MIN    = 1       # Confidence LiDAR minimum (0=low, 1=medium, 2=high).
 
 # ── Filtrage post-reconstruction ─────────────────────────────────────────────
@@ -597,7 +600,7 @@ class Record3DRecorder:
 
     # ── Pipeline complet post-enregistrement ──────────────────────────────────
 
-    def process_recording(self, record_duration):
+    def process_recording(self, record_duration, save_npz=False):
         """
         Exécute le pipeline complet :
         reconstruction → normales → sauvegarde PLY + logs.
@@ -605,6 +608,14 @@ class Record3DRecorder:
         if len(self.recorded_frames) < 2:
             print("⚠️  Pas assez de frames enregistrées (min 2).")
             return
+
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_dir   = os.path.join("logs", timestamp)
+        os.makedirs(log_dir, exist_ok=True)
+
+        if save_npz:
+            npz_path = os.path.join(log_dir, "scan.npz")
+            self.save_raw_recording(npz_path)
 
         # 1. Reconstruction (dispatch selon USE_TSDF)
         if USE_TSDF:
@@ -618,10 +629,6 @@ class Record3DRecorder:
         pcd, t_normals = self.compute_normals(pcd)
 
         # 3. Sauvegarde
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        log_dir   = os.path.join("logs", timestamp)
-        os.makedirs(log_dir, exist_ok=True)
-
         ply_path = os.path.join(log_dir, "reconstructed.ply")
         o3d.io.write_point_cloud(ply_path, pcd)
         n_final = stats.get('n_final_points', len(pcd.points))
@@ -698,9 +705,10 @@ class Record3DRecorder:
             })
         print(f"\u2705 Recording chargé : {n} frames depuis {path}")
         return frames
+
     # ── Boucle principale ─────────────────────────────────────────────────────
 
-    def run(self):
+    def run(self, save_npz=False):
         devices = Record3DStream.get_connected_devices()
         if not devices:
             print("❌ Aucun iPhone détecté via USB.")
@@ -753,7 +761,7 @@ class Record3DRecorder:
                 if self.recording:
                     record_duration = self.stop_recording()
                     cv2.destroyAllWindows()
-                    self.process_recording(record_duration)
+                    self.process_recording(record_duration, save_npz=save_npz)
                 print("Sortie demandée.")
                 break
 
@@ -763,7 +771,7 @@ class Record3DRecorder:
                 else:
                     record_duration = self.stop_recording()
                     cv2.destroyAllWindows()
-                    self.process_recording(record_duration)
+                    self.process_recording(record_duration, save_npz=save_npz)
 
                     if not self.stream_stopped.is_set():
                         print("\n   [ESPACE] → nouvel enregistrement   [Q/ESC] → quitter")
@@ -775,5 +783,14 @@ class Record3DRecorder:
 # ── Entrée ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Record3D capture + reconstruction")
+    parser.add_argument(
+        "--save-npz",
+        action="store_true",
+        default=False,
+        help="Sauvegarder le recording brut en logs/<datetime>/scan.npz",
+    )
+    args = parser.parse_args()
+
     recorder = Record3DRecorder()
-    recorder.run()
+    recorder.run(save_npz=args.save_npz)
