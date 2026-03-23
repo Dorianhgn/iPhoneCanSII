@@ -1,0 +1,25 @@
+# Configuration record_reconstruct.py
+# Les clés absentes gardent les valeurs par défaut du script.
+# Ce fichier peut être passé avec: --config config_record_reconstruct.yaml
+
+USE_TSDF: false
+USE_GPU: false
+
+FRAME_SKIP: 3
+MIN_TRAVEL_DIST: 0.01
+
+SUBSAMPLE: 2
+VOXEL_SIZE: 0.05
+
+TSDF_VOXEL_LENGTH: 0.005
+TSDF_SDF_TRUNC: 0.04
+TSDF_BLOCK_COUNT: 50000
+
+MAX_DEPTH: 6.0
+CONFIDENCE_MIN: 1
+
+OUTLIER_NB: 20
+OUTLIER_STD: 2.0
+
+NORMAL_KNN: 30
+NORMAL_RADIUS: 0.2

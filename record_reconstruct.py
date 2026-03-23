@@ -13,12 +13,14 @@ Pourquoi TSDF et pas accumulation de points ?
   - Pas besoin d'ICP a posteriori
 
 Prérequis :
-    pip install record3d open3d opencv-python numpy scipy
+    pip install record3d open3d opencv-python numpy scipy pyyaml
 
 Usage :
     1. Branche l'iPhone en USB
     2. Record3D app → Settings → "USB Streaming mode" activé
     3. Lance : python record_reconstruct.py
+    (optionnel) : python record_reconstruct.py --config config_record_reconstruct.yaml
+    (optionnel) : python record_reconstruct.py --from-npz logs/.../scan.npz -c une_config.yaml
     (optionnel) : python record_reconstruct.py --save-npz
     4. Appuie sur ⏺ dans l'app pour démarrer le flux
 
@@ -28,9 +30,13 @@ Contrôles :
 
 Sorties (dans logs/<datetime>/) :
     - reconstructed.ply   : nuage de points avec normales
-    - config.txt          : hyperparamètres utilisés
+    - config_record_reconstruct.yaml : hyperparamètres utilisés
     - performance.log     : métriques de performance
     - scan.npz            : recording brut (si --save-npz activé)
+
+En mode --from-npz :
+    - sortie dans logs/<datetime>/reconstruct_i/ (i auto-incrémenté)
+    - pas besoin de réenregistrer avec l'iPhone
 """
 
 import argparse
@@ -43,6 +49,11 @@ import cv2
 import open3d as o3d
 from scipy.spatial.transform import Rotation
 from record3d import Record3DStream
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -98,26 +109,79 @@ PREVIEW_W         = 1280    # Largeur max de la fenêtre preview OpenCV.
 #  Collecte pour logs
 # ══════════════════════════════════════════════════════════════════════════════
 
-HYPERPARAMS = {
-    "USE_TSDF":          USE_TSDF,
-    "USE_GPU":           USE_GPU,
-    "FRAME_SKIP":        FRAME_SKIP,
-    "MIN_TRAVEL_DIST":   MIN_TRAVEL_DIST,
-    # Mode rapide
-    "SUBSAMPLE":         SUBSAMPLE,
-    "VOXEL_SIZE":        VOXEL_SIZE,
-    # TSDF
-    "TSDF_VOXEL_LENGTH": TSDF_VOXEL_LENGTH,
-    "TSDF_SDF_TRUNC":    TSDF_SDF_TRUNC,
-    "TSDF_BLOCK_COUNT":  TSDF_BLOCK_COUNT,
-    # Commun
-    "MAX_DEPTH":         MAX_DEPTH,
-    "CONFIDENCE_MIN":    CONFIDENCE_MIN,
-    "OUTLIER_NB":        OUTLIER_NB,
-    "OUTLIER_STD":       OUTLIER_STD,
-    "NORMAL_KNN":        NORMAL_KNN,
-    "NORMAL_RADIUS":     NORMAL_RADIUS,
-}
+def get_hyperparams():
+    """Retourne les hyperparamètres courants (defaults + éventuels overrides YAML)."""
+    return {
+        "USE_TSDF":          USE_TSDF,
+        "USE_GPU":           USE_GPU,
+        "FRAME_SKIP":        FRAME_SKIP,
+        "MIN_TRAVEL_DIST":   MIN_TRAVEL_DIST,
+        # Mode rapide
+        "SUBSAMPLE":         SUBSAMPLE,
+        "VOXEL_SIZE":        VOXEL_SIZE,
+        # TSDF
+        "TSDF_VOXEL_LENGTH": TSDF_VOXEL_LENGTH,
+        "TSDF_SDF_TRUNC":    TSDF_SDF_TRUNC,
+        "TSDF_BLOCK_COUNT":  TSDF_BLOCK_COUNT,
+        # Commun
+        "MAX_DEPTH":         MAX_DEPTH,
+        "CONFIDENCE_MIN":    CONFIDENCE_MIN,
+        "OUTLIER_NB":        OUTLIER_NB,
+        "OUTLIER_STD":       OUTLIER_STD,
+        "NORMAL_KNN":        NORMAL_KNN,
+        "NORMAL_RADIUS":     NORMAL_RADIUS,
+    }
+
+
+def load_hyperparams_from_yaml(config_path):
+    """
+    Charge les overrides hyperparamètres depuis un YAML.
+    Les clés absentes gardent les valeurs par défaut définies dans ce script.
+    """
+    if not config_path:
+        return
+
+    if not os.path.exists(config_path):
+        print(f"ℹ️  Fichier config absent ({config_path}) → valeurs par défaut utilisées.")
+        return
+
+    if yaml is None:
+        print("⚠️  PyYAML non installé. Impossible de lire la config YAML, valeurs par défaut utilisées.")
+        print("   → Installe : pip install pyyaml")
+        return
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    if not isinstance(data, dict):
+        print(f"⚠️  Le fichier {config_path} ne contient pas un mapping YAML valide. Defaults conservés.")
+        return
+
+    valid = set(get_hyperparams().keys())
+    unknown = sorted(k for k in data.keys() if k not in valid)
+    if unknown:
+        print(f"⚠️  Clés YAML ignorées (inconnues) : {', '.join(unknown)}")
+
+    for key in valid:
+        if key in data:
+            globals()[key] = data[key]
+
+    print(f"✅ Config chargée depuis {config_path}")
+
+
+def make_reconstruct_output_dir(npz_path):
+    """
+    Crée un dossier reconstruct_i dans le dossier parent du .npz,
+    sans écraser les reconstructions existantes.
+    """
+    base_dir = os.path.dirname(os.path.abspath(npz_path))
+    i = 1
+    while True:
+        out_dir = os.path.join(base_dir, f"reconstruct_{i}")
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=False)
+            return out_dir
+        i += 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -548,15 +612,20 @@ class Record3DRecorder:
     # ── Sauvegarde des logs ───────────────────────────────────────────────────
 
     def save_logs(self, log_dir, record_duration, stats, t_normals):
-        """Écrit config.txt et performance.log dans log_dir."""
+        """Écrit la config YAML et performance.log dans log_dir."""
         os.makedirs(log_dir, exist_ok=True)
 
-        # config.txt — hyperparamètres
-        with open(os.path.join(log_dir, "config.txt"), "w") as f:
+        # config_record_reconstruct.yaml — hyperparamètres effectifs
+        config_path = os.path.join(log_dir, "config_record_reconstruct.yaml")
+        with open(config_path, "w", encoding="utf-8") as f:
             f.write("# Hyperparamètres de la reconstruction\n")
-            f.write(f"# Généré le {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-            for k, v in HYPERPARAMS.items():
-                f.write(f"{k} = {v}\n")
+            f.write(f"# Généré le {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            if yaml is not None:
+                yaml.safe_dump(get_hyperparams(), f, sort_keys=False, allow_unicode=True)
+            else:
+                # Fallback lisible même sans PyYAML.
+                for k, v in get_hyperparams().items():
+                    f.write(f"{k}: {v}\n")
 
         # performance.log — métriques
         t_recon  = stats.get('t_reconstruct', 0)
@@ -600,7 +669,7 @@ class Record3DRecorder:
 
     # ── Pipeline complet post-enregistrement ──────────────────────────────────
 
-    def process_recording(self, record_duration, save_npz=False):
+    def process_recording(self, record_duration, save_npz=False, output_dir=None):
         """
         Exécute le pipeline complet :
         reconstruction → normales → sauvegarde PLY + logs.
@@ -609,8 +678,11 @@ class Record3DRecorder:
             print("⚠️  Pas assez de frames enregistrées (min 2).")
             return
 
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        log_dir   = os.path.join("logs", timestamp)
+        if output_dir is not None:
+            log_dir = output_dir
+        else:
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            log_dir   = os.path.join("logs", timestamp)
         os.makedirs(log_dir, exist_ok=True)
 
         if save_npz:
@@ -785,6 +857,19 @@ class Record3DRecorder:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Record3D capture + reconstruction")
     parser.add_argument(
+        "-c",
+        "--config",
+        type=str,
+        default="config_record_reconstruct.yaml",
+        help="Chemin vers la config YAML (overrides partiels, defaults sinon)",
+    )
+    parser.add_argument(
+        "--from-npz",
+        type=str,
+        default=None,
+        help="Reconstruire depuis un scan.npz existant (sans iPhone)",
+    )
+    parser.add_argument(
         "--save-npz",
         action="store_true",
         default=False,
@@ -792,5 +877,19 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    load_hyperparams_from_yaml(args.config)
+
     recorder = Record3DRecorder()
-    recorder.run(save_npz=args.save_npz)
+    if args.from_npz:
+        npz_path = args.from_npz
+        if not os.path.exists(npz_path):
+            print(f"❌ Fichier NPZ introuvable : {npz_path}")
+            raise SystemExit(1)
+
+        print(f"📦 Reconstruction depuis NPZ : {npz_path}")
+        recorder.recorded_frames = Record3DRecorder.load_raw_recording(npz_path)
+        out_dir = make_reconstruct_output_dir(npz_path)
+        print(f"📁 Dossier de sortie : {out_dir}")
+        recorder.process_recording(record_duration=0.0, save_npz=False, output_dir=out_dir)
+    else:
+        recorder.run(save_npz=args.save_npz)
