@@ -33,18 +33,164 @@ import numpy as np
 import open3d as o3d
 import matplotlib.pyplot as plt
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 from record_reconstruct import Record3DRecorder, pose_to_matrix
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  HYPERPARAMÈTRES (VALEURS PAR DÉFAUT)
+#  Peuvent être overridés via --config/-c (YAML type config_record_reconstruct).
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Tri-plane / fenêtre temporelle ───────────────────────────────────────────
 TRIPLANE_RES = 128
-SPATIAL_EXTENT = 4.0
+SPATIAL_EXTENT = 4.0  # m ; taille de la zone projetée tri-plane (indépendant de MAX_DEPTH).
 N_FRAMES = 10
 START_INDEX = 0
 
-NORMAL_ANGLE_DEG = 30.0
-CONFIDENCE_MIN = 1
-NORMAL_VOXEL_SIZE = 0.05
-NORMAL_PROPAGATE_RADIUS = 0.1
+# ── Overlay de normales (compat view_ply) ────────────────────────────────────
+ARROW_ANGLE_DEG_THRESHOLD = 30.0   # deg ; seuil angle pour classer "steep".
+ARROW_ANGLE_AXIS = [0.0, 1.0, 0.0] # axe monde de référence (Y par défaut).
+ARROW_STEP = 2                     # sous-échantillonnage des points pour normales.
+
+# ── Filtrage / estimation des normales ───────────────────────────────────────
+CONFIDENCE_MIN = 1                 # filtre confidence LiDAR mini (0/1/2).
+NORMAL_VOXEL_SIZE = 0.05           # m ; voxel downsample avant estimation normales.
+NORMAL_PROPAGATE_RADIUS = 0.1      # m ; rayon max de propagation au nuage complet.
+NORMAL_KNN = 30                    # nb voisins max pour estimation normales.
+NORMAL_RADIUS = 0.12               # m ; rayon de recherche pour estimation normales.
+FRAME_SKIP = 1                     # stride temporel d'accumulation des frames.
+
+
+def _coerce_float(value, key):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} doit être un float (reçu: {value})")
+
+
+def _coerce_int(value, key, min_value=None):
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} doit être un int (reçu: {value})")
+
+    if min_value is not None and out < min_value:
+        raise ValueError(f"{key} doit être >= {min_value} (reçu: {out})")
+    return out
+
+
+def _coerce_axis3(value, key):
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{key} doit être une liste de 3 valeurs")
+    axis = np.asarray(value, dtype=np.float64)
+    norm = np.linalg.norm(axis)
+    if norm < 1e-12:
+        raise ValueError(f"{key} ne peut pas être nul")
+    return axis.tolist()
+
+
+def load_hyperparams_from_yaml(config_path):
+    """
+    Charge des hyperparamètres depuis un YAML de reconstruction.
+
+        Clés mappées principales :
+      - VOXEL_SIZE -> NORMAL_VOXEL_SIZE
+      - NORMAL_KNN -> NORMAL_KNN
+      - NORMAL_RADIUS -> NORMAL_RADIUS
+      - FRAME_SKIP -> FRAME_SKIP
+      - CONFIDENCE_MIN -> CONFIDENCE_MIN
+      - ARROW_ANGLE_DEG_THRESHOLD, ARROW_ANGLE_AXIS, ARROW_STEP
+
+        Note: MAX_DEPTH (profondeur capteur) et SPATIAL_EXTENT (taille de la boîte
+        d'affichage tri-plane) ne sont pas mappés automatiquement car ce ne sont
+        pas la même grandeur.
+    """
+    if not config_path:
+        return
+
+    if yaml is None:
+        print("⚠️  PyYAML non installé. --config ignoré (installe: pip install pyyaml)")
+        return
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        print(f"⚠️  Fichier config introuvable: {config_path} (defaults conservés)")
+        return
+    except Exception as e:
+        print(f"⚠️  Erreur lecture YAML ({config_path}): {e} (defaults conservés)")
+        return
+
+    if not isinstance(data, dict):
+        print(f"⚠️  YAML invalide (mapping attendu): {config_path} (defaults conservés)")
+        return
+
+    mapping = {
+        "VOXEL_SIZE": "NORMAL_VOXEL_SIZE",
+        "NORMAL_KNN": "NORMAL_KNN",
+        "NORMAL_RADIUS": "NORMAL_RADIUS",
+        "FRAME_SKIP": "FRAME_SKIP",
+        "CONFIDENCE_MIN": "CONFIDENCE_MIN",
+        "ARROW_ANGLE_DEG_THRESHOLD": "ARROW_ANGLE_DEG_THRESHOLD",
+        "ARROW_ANGLE_AXIS": "ARROW_ANGLE_AXIS",
+        "ARROW_STEP": "ARROW_STEP",
+        "NORMAL_PROPAGATE_RADIUS": "NORMAL_PROPAGATE_RADIUS",
+        # Accepte aussi des clés natives triplane si présentes dans le YAML.
+        "TRIPLANE_RES": "TRIPLANE_RES",
+        "SPATIAL_EXTENT": "SPATIAL_EXTENT",
+        "N_FRAMES": "N_FRAMES",
+        "START_INDEX": "START_INDEX",
+        # Alias rétrocompat.
+        "NORMAL_ANGLE_DEG": "ARROW_ANGLE_DEG_THRESHOLD",
+    }
+
+    if "MAX_DEPTH" in data and "SPATIAL_EXTENT" not in data:
+        print(
+            "ℹ️  MAX_DEPTH détecté dans la config mais non appliqué à SPATIAL_EXTENT "
+            "(paramètres distincts)."
+        )
+
+    updated = []
+    for src_key, dst_key in mapping.items():
+        if src_key not in data:
+            continue
+        raw = data[src_key]
+        try:
+            if dst_key in {
+                "SPATIAL_EXTENT",
+                "NORMAL_VOXEL_SIZE",
+                "NORMAL_RADIUS",
+                "ARROW_ANGLE_DEG_THRESHOLD",
+                "NORMAL_PROPAGATE_RADIUS",
+            }:
+                value = _coerce_float(raw, src_key)
+            elif dst_key in {"TRIPLANE_RES", "N_FRAMES", "START_INDEX"}:
+                value = _coerce_int(raw, src_key, min_value=0)
+            elif dst_key in {"CONFIDENCE_MIN", "NORMAL_KNN", "FRAME_SKIP", "ARROW_STEP"}:
+                value = _coerce_int(raw, src_key, min_value=1)
+            elif dst_key == "ARROW_ANGLE_AXIS":
+                value = _coerce_axis3(raw, src_key)
+            else:
+                value = raw
+        except ValueError as e:
+            print(f"⚠️  {e} -> clé ignorée")
+            continue
+
+        globals()[dst_key] = value
+        updated.append((src_key, dst_key, value))
+
+    if updated:
+        print(f"✅ Config chargée depuis {config_path}")
+        for src_key, dst_key, value in updated:
+            print(f"   {src_key} -> {dst_key} = {value}")
+    else:
+        print(f"ℹ️  Aucune clé utile trouvée dans {config_path} (defaults conservés)")
 
 
 def map_to_pixels(coords, half_extent, res):
@@ -218,19 +364,17 @@ def resolve_window_indices(total_frames, start_index, n_frames, past_mode=False)
 
     start_index = int(np.clip(start_index, 0, total_frames - 1))
     n_frames = max(1, int(n_frames))
+    frame_skip = max(1, int(FRAME_SKIP))
 
     if past_mode:
-        # Requested: [start_index - n_frames : start_index + 1], anchor at present.
-        begin = max(0, start_index - n_frames)
-        end_exclusive = min(total_frames, start_index + 1)
-    else:
-        # Current mode: [start_index : start_index + n_frames], anchor at first frame.
-        begin = start_index
-        end_exclusive = min(total_frames, start_index + n_frames)
+        # Prend n_frames échantillons vers le passé, en incluant start_index.
+        begin = max(0, start_index - (n_frames - 1) * frame_skip)
+        idx_desc = list(range(start_index, begin - 1, -frame_skip))
+        return idx_desc[::-1]  # ordre chronologique (ancien -> récent)
 
-    if begin >= end_exclusive:
-        return []
-    return list(range(begin, end_exclusive))
+    # Prend n_frames échantillons vers le futur, en incluant start_index.
+    end = min(total_frames - 1, start_index + (n_frames - 1) * frame_skip)
+    return list(range(start_index, end + 1, frame_skip))
 
 
 def frame_points_in_frame0(frame, t0_inv):
@@ -316,9 +460,10 @@ def accumulate_points(frames, n_frames, start_index=0, past_mode=False):
     )
     t0_inv = np.linalg.inv(t0)
 
-    up_world = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-    up_frame0 = t0_inv[:3, :3] @ up_world
-    up_frame0 /= np.linalg.norm(up_frame0) + 1e-12
+    axis_world = np.asarray(ARROW_ANGLE_AXIS, dtype=np.float64)
+    axis_world /= np.linalg.norm(axis_world) + 1e-12
+    axis_frame0 = t0_inv[:3, :3] @ axis_world
+    axis_frame0 /= np.linalg.norm(axis_frame0) + 1e-12
 
     chunks = []
     color_chunks = []
@@ -332,10 +477,10 @@ def accumulate_points(frames, n_frames, start_index=0, past_mode=False):
         return (
             np.empty((0, 3), dtype=np.float32),
             np.empty((0, 3), dtype=np.float32),
-            up_frame0.astype(np.float32),
+            axis_frame0.astype(np.float32),
         )
 
-    return np.vstack(chunks), np.vstack(color_chunks), up_frame0.astype(np.float32)
+    return np.vstack(chunks), np.vstack(color_chunks), axis_frame0.astype(np.float32)
 
 
 def compute_steep_mask(points, vertical_axis, skip_normals=False):
@@ -344,8 +489,11 @@ def compute_steep_mask(points, vertical_axis, skip_normals=False):
     if skip_normals or points.shape[0] < 8:
         return np.zeros(points.shape[0], dtype=bool), (time.perf_counter() - t0) * 1000.0
 
+    sample_step = max(1, int(ARROW_STEP))
+    sampled_points = points[::sample_step] if sample_step > 1 else points
+
     pcd_full = o3d.geometry.PointCloud()
-    pcd_full.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+    pcd_full.points = o3d.utility.Vector3dVector(sampled_points.astype(np.float64))
 
     pcd_ds = pcd_full.voxel_down_sample(NORMAL_VOXEL_SIZE)
     ds_points = np.asarray(pcd_ds.points)
@@ -353,7 +501,10 @@ def compute_steep_mask(points, vertical_axis, skip_normals=False):
         return np.zeros(points.shape[0], dtype=bool), (time.perf_counter() - t0) * 1000.0
 
     pcd_ds.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.12, max_nn=30)
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=NORMAL_RADIUS,
+            max_nn=max(3, int(NORMAL_KNN)),
+        )
     )
     ds_normals = np.asarray(pcd_ds.normals)
     if ds_normals.shape[0] == 0:
@@ -363,7 +514,7 @@ def compute_steep_mask(points, vertical_axis, skip_normals=False):
     vertical /= np.linalg.norm(vertical) + 1e-12
 
     cos_abs_ds = np.abs(ds_normals @ vertical)
-    threshold = np.cos(np.deg2rad(NORMAL_ANGLE_DEG))
+    threshold = np.cos(np.deg2rad(ARROW_ANGLE_DEG_THRESHOLD))
     steep_ds = cos_abs_ds < threshold
 
     steep_full = np.zeros(points.shape[0], dtype=bool)
@@ -427,7 +578,13 @@ def density_series(frames, max_n, res, extent, start_index=0, past_mode=False):
     if start_index >= len(frames):
         return [], []
 
-    nmax = min(max_n, len(frames) - start_index)
+    frame_skip = max(1, int(FRAME_SKIP))
+    if past_mode:
+        available = (start_index // frame_skip) + 1
+    else:
+        available = ((len(frames) - 1 - start_index) // frame_skip) + 1
+
+    nmax = min(max_n, available)
     xs = list(range(1, nmax + 1))
     ys = []
 
@@ -641,8 +798,20 @@ def interactive_viewer(
 
 
 def main():
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument(
+        "-c",
+        "--config",
+        type=str,
+        default=None,
+        help="Chemin vers un YAML de config (ex: config_record_reconstruct.yaml)",
+    )
+    pre_args, _ = pre_parser.parse_known_args()
+    load_hyperparams_from_yaml(pre_args.config)
+
     parser = argparse.ArgumentParser(
-        description="Probe tri-plane from a Record3D .npz recording."
+        description="Probe tri-plane from a Record3D .npz recording.",
+        parents=[pre_parser],
     )
     parser.add_argument("recording", help="Path to .npz recording")
     parser.add_argument(
@@ -695,10 +864,11 @@ def main():
 
     max_start = max(0, len(frames) - 1)
     start_index = int(np.clip(args.start_index, 0, max_start))
+    frame_skip = max(1, int(FRAME_SKIP))
     if args.past_mode:
-        n_available = start_index + 1
+        n_available = (start_index // frame_skip) + 1
     else:
-        n_available = len(frames) - start_index
+        n_available = ((len(frames) - 1 - start_index) // frame_skip) + 1
     n_used = min(args.n_frames, n_available)
     if n_used < args.n_frames:
         print(
