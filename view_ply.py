@@ -17,6 +17,11 @@ import argparse
 import numpy as np
 import open3d as o3d
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  HYPERPARAMÈTRES D'AFFICHAGE
@@ -35,6 +40,103 @@ FRAME_SIZE      = 0.3               # Taille du repère XYZ en m (X=rouge, Y=ver
 # ── Normales (utilisé seulement si le PLY n'en contient pas) ──────────────────
 NORMAL_KNN      = 30
 NORMAL_RADIUS   = 0.05
+
+
+def _coerce_float(value, key):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} doit être un float (reçu: {value})")
+
+
+def _coerce_int(value, key, min_value=None):
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} doit être un int (reçu: {value})")
+
+    if min_value is not None and out < min_value:
+        raise ValueError(f"{key} doit être >= {min_value} (reçu: {out})")
+    return out
+
+
+def _coerce_axis3(value, key):
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{key} doit être une liste de 3 valeurs")
+    axis = np.asarray(value, dtype=np.float64)
+    norm = np.linalg.norm(axis)
+    if norm < 1e-12:
+        raise ValueError(f"{key} ne peut pas être nul")
+    return axis.tolist()
+
+
+def load_hyperparams_from_yaml(config_path):
+    """Charge les réglages d'affichage depuis un YAML compatible reconstruction."""
+    if not config_path:
+        return
+
+    if yaml is None:
+        print("⚠️  PyYAML non installé. --config ignoré (installe: pip install pyyaml)")
+        return
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        print(f"⚠️  Fichier config introuvable: {config_path} (defaults conservés)")
+        return
+    except Exception as e:
+        print(f"⚠️  Erreur lecture YAML ({config_path}): {e} (defaults conservés)")
+        return
+
+    if not isinstance(data, dict):
+        print(f"⚠️  YAML invalide (mapping attendu): {config_path} (defaults conservés)")
+        return
+
+    mapping = {
+        "POINT_SIZE": "POINT_SIZE",
+        "ARROW_LENGTH": "ARROW_LENGTH",
+        "ARROW_ANGLE_DEG_THRESHOLD": "ARROW_ANGLE_DEG_THRESHOLD",
+        "ARROW_ANGLE_AXIS": "ARROW_ANGLE_AXIS",
+        "ARROW_STEP": "ARROW_STEP",
+        "NORMAL_KNN": "NORMAL_KNN",
+        "NORMAL_RADIUS": "NORMAL_RADIUS",
+        "BG_COLOR": "BG_COLOR",
+        "FRAME_SIZE": "FRAME_SIZE",
+    }
+
+    updated = []
+    for src_key, dst_key in mapping.items():
+        if src_key not in data:
+            continue
+
+        raw = data[src_key]
+        try:
+            if dst_key in {"POINT_SIZE", "ARROW_LENGTH", "NORMAL_RADIUS", "FRAME_SIZE", "ARROW_ANGLE_DEG_THRESHOLD"}:
+                value = _coerce_float(raw, src_key)
+            elif dst_key in {"NORMAL_KNN", "ARROW_STEP"}:
+                value = _coerce_int(raw, src_key, min_value=1)
+            elif dst_key == "ARROW_ANGLE_AXIS":
+                value = _coerce_axis3(raw, src_key)
+            elif dst_key == "BG_COLOR":
+                if not isinstance(raw, (list, tuple)) or len(raw) != 3:
+                    raise ValueError(f"{src_key} doit être une liste de 3 valeurs")
+                value = [float(v) for v in raw]
+            else:
+                value = raw
+        except ValueError as e:
+            print(f"⚠️  {e} -> clé ignorée")
+            continue
+
+        globals()[dst_key] = value
+        updated.append((src_key, dst_key, value))
+
+    if updated:
+        print(f"✅ Config chargée depuis {config_path}")
+        for src_key, dst_key, value in updated:
+            print(f"   {src_key} -> {dst_key} = {value}")
+    else:
+        print(f"ℹ️  Aucune clé utile trouvée dans {config_path} (defaults conservés)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -227,8 +329,20 @@ def view_pointcloud(ply_path):
 # ── Entrée ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument(
+        "-c",
+        "--config",
+        type=str,
+        default=None,
+        help="Chemin vers un YAML de config compatible reconstruction",
+    )
+    pre_args, _ = pre_parser.parse_known_args()
+    load_hyperparams_from_yaml(pre_args.config)
+
     parser = argparse.ArgumentParser(
-        description="Visualiseur de nuage de points PLY avec normales (Open3D)"
+        description="Visualiseur de nuage de points PLY avec normales (Open3D)",
+        parents=[pre_parser],
     )
     parser.add_argument(
         "ply_path",
