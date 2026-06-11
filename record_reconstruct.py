@@ -58,7 +58,7 @@ except ImportError:
 
 # Bake spec §4 (segmentation + scene.json). Imports légers (ultralytics chargé
 # paresseusement seulement quand on segmente vraiment).
-from segmentation import Segmenter, Taxonomy
+from segmentation import Segmenter, Taxonomy, DEFAULT_TAXONOMY
 from scene_export import bake_scene
 
 try:
@@ -117,7 +117,6 @@ YOLO_MODEL        = "yolo26s-seg.pt"  # Modèle YOLO-seg (fallback yolov8s-seg.p
 YOLO_CONF         = 0.4     # Seuil de confiance des détections.
 SEG_ENABLED       = False   # Défaut de l'overlay live ('y') ET intent d'enregistrement.
                             # Verrouillé au démarrage de l'enregistrement (guardrail).
-SEG_INCLUDE_OTHER = False   # True → classes COCO non mappées → classe ICANSII 'autre'.
 SEG_ASSIGN_RADIUS = 0.06    # m : rayon max pour attacher une classe à un point final.
 
 # ── Bake scène (spec §4) ──────────────────────────────────────────────────────
@@ -160,7 +159,6 @@ def get_hyperparams():
         "YOLO_MODEL":        YOLO_MODEL,
         "YOLO_CONF":         YOLO_CONF,
         "SEG_ENABLED":       SEG_ENABLED,
-        "SEG_INCLUDE_OTHER": SEG_INCLUDE_OTHER,
         "SEG_ASSIGN_RADIUS": SEG_ASSIGN_RADIUS,
         "ARROW_ANGLE_DEG_THRESHOLD": ARROW_ANGLE_DEG_THRESHOLD,
         "ARROW_ANGLE_AXIS":  ARROW_ANGLE_AXIS,
@@ -663,7 +661,7 @@ class Record3DRecorder:
             self._segmenter = Segmenter(
                 model_path=YOLO_MODEL,
                 conf=YOLO_CONF,
-                taxonomy=Taxonomy(include_other=SEG_INCLUDE_OTHER),
+                taxonomy=DEFAULT_TAXONOMY,
             )
         return self._segmenter
 
@@ -859,7 +857,7 @@ class Record3DRecorder:
                 else np.full((len(pcd.points), 3), 200, np.uint8),
             normals=np.asarray(pcd.normals) if pcd.has_normals() else None,
             class_ids=class_ids,
-            taxonomy=Taxonomy(include_other=SEG_INCLUDE_OTHER),
+            taxonomy=DEFAULT_TAXONOMY,
             angle_axis=ARROW_ANGLE_AXIS,
             angle_threshold_deg=ARROW_ANGLE_DEG_THRESHOLD,
             obstacle_dim=OBSTACLE_DIM,

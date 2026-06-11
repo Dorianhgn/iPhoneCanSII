@@ -28,7 +28,6 @@ NORMAL_RADIUS: 0.2
 YOLO_MODEL: yolo26s-seg.pt   # fallback automatique → yolov8s-seg.pt si absent
 YOLO_CONF: 0.4
 SEG_ENABLED: false           # défaut de l'overlay live (touche Y) + intent d'enreg.
-SEG_INCLUDE_OTHER: false     # true → classes COCO non mappées → classe ICANSII 'autre'
 SEG_ASSIGN_RADIUS: 0.06      # m : rayon max pour attacher une classe à un point final
 
 # ── Bake scène pour la web-app pitch (spec §4) ────────────────────────────────
