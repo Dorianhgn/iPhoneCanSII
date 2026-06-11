@@ -6,9 +6,14 @@ This repository captures RGBD data with Record3D, reconstructs 3D clouds, and pr
 
 Main scripts:
 
-- [record_reconstruct.py](record_reconstruct.py): capture and reconstruct a point cloud
+- [record_reconstruct.py](record_reconstruct.py): capture and reconstruct a point cloud, **and bake the pitch web-app scene (spec §4)**
 - [view_ply.py](view_ply.py): interactive viewer for `.ply` files
 - [triplane_probe.py](triplane_probe.py): tri-plane coverage / density analysis on raw `.npz` recordings
+
+Supporting modules:
+
+- [segmentation.py](segmentation.py): YOLO-seg wrapper + 9-class **ICANSII taxonomy** (live overlay + offline class projection)
+- [scene_export.py](scene_export.py): bakes `scene.json` + 3 colored `.ply` (the `neutral` / `obstacles` / `segmentation` states) for the presentation app
 
 ## Quickstart
 
@@ -75,6 +80,8 @@ Script-specific keys:
 	- `TSDF_VOXEL_LENGTH`, `TSDF_SDF_TRUNC`, `TSDF_BLOCK_COUNT`
 	- `MAX_DEPTH`
 	- `OUTLIER_NB`, `OUTLIER_STD`
+	- `YOLO_MODEL`, `YOLO_CONF`, `SEG_ENABLED`, `SEG_INCLUDE_OTHER`, `SEG_ASSIGN_RADIUS` (segmentation)
+	- `OBSTACLE_DIM`, `MAX_POINTS`, `RECENTER` (scene bake, §4); `ARROW_ANGLE_DEG_THRESHOLD` / `ARROW_ANGLE_AXIS` define the obstacle normal cutoff
 
 - `view_ply.py`
 	- `POINT_SIZE`
@@ -108,8 +115,46 @@ Relevant flags:
 - `-c`, `--config`: load a YAML config
 - `--from-npz`: replay a saved recording
 - `--save-npz`: save the raw recording for later reuse
+- `--yolo` / `--no-yolo`: force the YOLO segmentation intent ON/OFF (overlay + bake)
+- `--max-points`: point budget of the baked cloud (default 200000, `< ~200k` for 60 FPS web)
+
+Live controls:
+
+- `[SPACE]` start / stop recording
+- `[Y]` toggle the **live YOLO-seg overlay** on the RGB feed — **only outside recording**.
+  The YOLO intent is **locked when recording starts** (guardrail): a recording is either
+  *with* or *without* YOLO and cannot change mid-capture.
+- `[Q / ESC]` quit
 
 The top of [record_reconstruct.py](record_reconstruct.py) documents the reconstruction defaults and what each one controls.
+
+### Pitch web-app bake (spec §4)
+
+Every reconstruction (live stop **or** `--from-npz`) bakes the data contract consumed by the
+presentation web app under `logs/<...>/scene/`:
+
+- `scene.json` — single file: `positions` (once) + `colors.{neutral,obstacles,segmentation}`
+  (all share the **exact same vertex order**) + `labels` (class centroids for the segmentation state).
+- `neutral.ply` / `obstacles.ply` / `segmentation.ply` — fallback, same vertex order.
+
+The three color states:
+
+- **neutral** — raw sensor RGB.
+- **obstacles** — points whose normal is `> ARROW_ANGLE_DEG_THRESHOLD` from the vertical axis
+  (walls / standing objects) painted red; the rest dimmed (`OBSTACLE_DIM`). Normals never leave Python.
+- **segmentation** — per-class ICANSII colors on recognized objects (YOLO run **offline** on the
+  stored RGB, projected to 3D by nearest-neighbour); everything else stays neutral gray.
+
+Two assets for §11 are also written next to the cloud: `rgb.png` + colorized `depth.png`
+(a representative middle frame).
+
+> **Offline bake without an iPhone:** `record3d` is imported lazily, so `--from-npz` baking runs on
+> any machine (e.g. a Linux server) with `open3d` + `ultralytics` installed. Only live capture needs `record3d`.
+
+> ⚠️ **ICANSII taxonomy:** the 9-class taxonomy (COCO→ICANSII mapping, colors, FR labels) was not
+> defined anywhere in the repo. A reasonable urban-navigation default lives in
+> [segmentation.py](segmentation.py) (`DEFAULT_TAXONOMY`) — **review and adjust it** to the real
+> referential before the pitch.
 
 ### What each major hparam means
 

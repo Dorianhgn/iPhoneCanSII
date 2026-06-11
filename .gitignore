@@ -226,3 +226,5 @@ logs/
 *.jpg
 *.jpeg
 *.gif
+# project verification venv (linux offline bake)
+.venv-icansii/

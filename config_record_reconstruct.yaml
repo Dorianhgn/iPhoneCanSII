@@ -23,3 +23,17 @@ OUTLIER_STD: 2.0
 
 NORMAL_KNN: 30
 NORMAL_RADIUS: 0.2
+
+# ── Segmentation YOLO (état couleur 'segmentation' + labels, spec §4) ──────────
+YOLO_MODEL: yolo26s-seg.pt   # fallback automatique → yolov8s-seg.pt si absent
+YOLO_CONF: 0.4
+SEG_ENABLED: false           # défaut de l'overlay live (touche Y) + intent d'enreg.
+SEG_INCLUDE_OTHER: false     # true → classes COCO non mappées → classe ICANSII 'autre'
+SEG_ASSIGN_RADIUS: 0.06      # m : rayon max pour attacher une classe à un point final
+
+# ── Bake scène pour la web-app pitch (spec §4) ────────────────────────────────
+ARROW_ANGLE_DEG_THRESHOLD: 30.0   # seuil normale↔verticale → obstacle (rouge)
+ARROW_ANGLE_AXIS: [0.0, 1.0, 0.0] # axe vertical de référence
+OBSTACLE_DIM: 0.30                # atténuation des points non-obstacle
+MAX_POINTS: 200000                # budget points du nuage baké (< ~200k pour 60 FPS web)
+RECENTER: true                    # recentrer le nuage à l'origine

@@ -48,7 +48,18 @@ import numpy as np
 import cv2
 import open3d as o3d
 from scipy.spatial.transform import Rotation
-from record3d import Record3DStream
+
+# record3d n'est nécessaire que pour la capture live (iPhone branché).
+# Import paresseux : le bake offline (--from-npz) tourne sans lui.
+try:
+    from record3d import Record3DStream
+except ImportError:
+    Record3DStream = None
+
+# Bake spec §4 (segmentation + scene.json). Imports légers (ultralytics chargé
+# paresseusement seulement quand on segmente vraiment).
+from segmentation import Segmenter, Taxonomy
+from scene_export import bake_scene
 
 try:
     import yaml
@@ -101,6 +112,21 @@ OUTLIER_STD       = 2.0     # Seuil en écarts-types. Plus petit = plus agressif
 NORMAL_KNN        = 30      # Nb voisins pour estimation PCA des normales.
 NORMAL_RADIUS     = 0.05    # Rayon max (m) pour chercher les voisins.
 
+# ── Segmentation YOLO (état couleur 'segmentation' + labels, spec §4) ─────────
+YOLO_MODEL        = "yolo26s-seg.pt"  # Modèle YOLO-seg (fallback yolov8s-seg.pt).
+YOLO_CONF         = 0.4     # Seuil de confiance des détections.
+SEG_ENABLED       = False   # Défaut de l'overlay live ('y') ET intent d'enregistrement.
+                            # Verrouillé au démarrage de l'enregistrement (guardrail).
+SEG_INCLUDE_OTHER = False   # True → classes COCO non mappées → classe ICANSII 'autre'.
+SEG_ASSIGN_RADIUS = 0.06    # m : rayon max pour attacher une classe à un point final.
+
+# ── Bake scène (spec §4) ──────────────────────────────────────────────────────
+ARROW_ANGLE_DEG_THRESHOLD = 30.0       # Seuil angulaire normale↔verticale (obstacle).
+ARROW_ANGLE_AXIS          = [0.0, 1.0, 0.0]  # Axe vertical de référence.
+OBSTACLE_DIM      = 0.30    # Atténuation des points NON-obstacle (état obstacles).
+MAX_POINTS        = 200000  # Budget de points du nuage baké (< ~200k pour 60 FPS web).
+RECENTER          = True    # Recentrer le nuage à l'origine (auto-rotation centrée).
+
 # ── Preview ───────────────────────────────────────────────────────────────────
 PREVIEW_W         = 1280    # Largeur max de la fenêtre preview OpenCV.
 
@@ -130,6 +156,17 @@ def get_hyperparams():
         "OUTLIER_STD":       OUTLIER_STD,
         "NORMAL_KNN":        NORMAL_KNN,
         "NORMAL_RADIUS":     NORMAL_RADIUS,
+        # Segmentation + bake §4
+        "YOLO_MODEL":        YOLO_MODEL,
+        "YOLO_CONF":         YOLO_CONF,
+        "SEG_ENABLED":       SEG_ENABLED,
+        "SEG_INCLUDE_OTHER": SEG_INCLUDE_OTHER,
+        "SEG_ASSIGN_RADIUS": SEG_ASSIGN_RADIUS,
+        "ARROW_ANGLE_DEG_THRESHOLD": ARROW_ANGLE_DEG_THRESHOLD,
+        "ARROW_ANGLE_AXIS":  ARROW_ANGLE_AXIS,
+        "OBSTACLE_DIM":      OBSTACLE_DIM,
+        "MAX_POINTS":        MAX_POINTS,
+        "RECENTER":          RECENTER,
     }
 
 
@@ -226,6 +263,12 @@ class Record3DRecorder:
         self.last_pose_position = None
         self.frame_counter      = 0
 
+        # Segmentation YOLO
+        self._segmenter         = None          # chargé paresseusement
+        self.yolo_enabled       = bool(SEG_ENABLED)  # toggle live ('y')
+        self.yolo_locked        = bool(SEG_ENABLED)  # intent verrouillé pdt l'enregistrement
+        self._last_overlay      = None          # cache overlay live
+
     # ── Utilitaires ───────────────────────────────────────────────────────────
 
     def get_intrinsic_mat_from_coeffs(self, coeffs, depth_w, depth_h, rgb_w, rgb_h):
@@ -315,8 +358,12 @@ class Record3DRecorder:
         self.frame_counter      = 0
         self.last_pose_position = None
         self.record_start_time  = time.time()
+        # Guardrail : on fige l'intent YOLO au démarrage — il ne peut plus changer
+        # pendant l'enregistrement. L'enregistrement est donc "avec" ou "sans" YOLO.
+        self.yolo_locked        = bool(self.yolo_enabled)
         self.recording          = True
-        print("🔴 Enregistrement démarré — bouge l'iPhone lentement.")
+        state = "AVEC YOLO" if self.yolo_locked else "SANS YOLO"
+        print(f"🔴 Enregistrement démarré ({state}, verrouillé) — bouge l'iPhone lentement.")
 
     def stop_recording(self):
         self.recording = False
@@ -609,6 +656,91 @@ class Record3DRecorder:
         print(f"  ✅ Normales calculées en {t_normals:.2f}s")
         return pcd, t_normals
 
+    # ── Segmentation : projette les classes ICANSII sur le nuage final ────────
+    def get_segmenter(self):
+        """Charge (paresseusement) le Segmenter YOLO partagé."""
+        if self._segmenter is None:
+            self._segmenter = Segmenter(
+                model_path=YOLO_MODEL,
+                conf=YOLO_CONF,
+                taxonomy=Taxonomy(include_other=SEG_INCLUDE_OTHER),
+            )
+        return self._segmenter
+
+    def segment_cloud(self, frames, final_points):
+        """
+        Exécute YOLO-seg sur chaque frame RGB stockée, déprojette les pixels
+        classés en 3D (mêmes intrinsèques que la reconstruction), puis attache
+        une classe ICANSII à chaque point final par plus-proche-voisin.
+
+        Retourne (class_ids (N,) int16 [-1=aucune], stats_dict).
+        L'inférence est 100% offline (spec §4 : aucune inférence côté web).
+        """
+        from scipy.spatial import cKDTree
+
+        seg = self.get_segmenter()
+        print(f"\n🧠 Segmentation offline de {len(frames)} frames (modèle {YOLO_MODEL})...")
+        t0 = time.time()
+
+        lab_pts, lab_cls = [], []
+        n_inst = 0
+        for i, frame in enumerate(frames):
+            if (i + 1) % 25 == 0 or i == len(frames) - 1:
+                print(f"  Frame {i+1}/{len(frames)} | instances cumulées : {n_inst}")
+
+            rgb        = frame['rgb']
+            depth      = frame['depth']
+            K          = frame['intrinsic']
+            confidence = frame['confidence']
+            H, W       = depth.shape
+
+            instances = seg.infer(rgb)
+            n_inst += len(instances)
+            cmap = seg.class_map(instances, H, W)      # (H,W) int16, -1 = aucune
+
+            ys, xs = np.where(cmap >= 0)
+            if len(xs) == 0:
+                continue
+            z = depth[ys, xs]
+            valid = (z > 0) & (z < MAX_DEPTH)
+            if confidence is not None:
+                valid &= (confidence[ys, xs] >= CONFIDENCE_MIN)
+            xs, ys, z = xs[valid], ys[valid], z[valid]
+            if len(z) == 0:
+                continue
+            cls = cmap[ys, xs]
+
+            fx, cx, fy, cy = K[0, 0], K[0, 2], K[1, 1], K[1, 2]
+            local = np.stack([(xs - cx) * z / fx, -(ys - cy) * z / fy, -z], axis=-1)
+            p = frame['pose']
+            T = pose_to_matrix(p['qx'], p['qy'], p['qz'], p['qw'],
+                               p['tx'], p['ty'], p['tz'])
+            world = (T[:3, :3] @ local.T).T + T[:3, 3]
+            lab_pts.append(world)
+            lab_cls.append(cls)
+
+        class_ids = np.full(len(final_points), -1, dtype=np.int16)
+        stats = {'n_instances': n_inst, 'n_labeled_raw': 0, 'n_assigned': 0,
+                 't_segment': time.time() - t0}
+        if not lab_pts:
+            print("  ⚠️  Aucun objet segmenté → état segmentation vide (gris neutre).")
+            return class_ids, stats
+
+        lab_pts = np.vstack(lab_pts)
+        lab_cls = np.concatenate(lab_cls).astype(np.int16)
+        stats['n_labeled_raw'] = int(len(lab_pts))
+
+        tree = cKDTree(lab_pts)
+        d, idx = tree.query(final_points, k=1, distance_upper_bound=SEG_ASSIGN_RADIUS)
+        hit = np.isfinite(d)
+        class_ids[hit] = lab_cls[idx[hit]]
+        stats['n_assigned'] = int(hit.sum())
+        stats['t_segment'] = time.time() - t0
+        print(f"  ✅ Segmentation : {n_inst} instances, "
+              f"{stats['n_assigned']:,}/{len(final_points):,} points classés "
+              f"en {stats['t_segment']:.1f}s")
+        return class_ids, stats
+
     # ── Sauvegarde des logs ───────────────────────────────────────────────────
 
     def save_logs(self, log_dir, record_duration, stats, t_normals):
@@ -700,13 +832,50 @@ class Record3DRecorder:
         # 2. Normales
         pcd, t_normals = self.compute_normals(pcd)
 
-        # 3. Sauvegarde
+        # 3. Sauvegarde brute (compat) : reconstructed.ply (RGB + normales)
         ply_path = os.path.join(log_dir, "reconstructed.ply")
         o3d.io.write_point_cloud(ply_path, pcd)
         n_final = stats.get('n_final_points', len(pcd.points))
         print(f"💾 Nuage sauvegardé → {ply_path}  ({n_final:,} points + normales)")
 
-        # 4. Logs
+        # 4. Segmentation offline (si l'enregistrement était "avec YOLO")
+        class_ids = None
+        if self.yolo_locked:
+            try:
+                class_ids, seg_stats = self.segment_cloud(
+                    self.recorded_frames, np.asarray(pcd.points)
+                )
+                stats.update(seg_stats)
+            except Exception as e:
+                print(f"⚠️  Segmentation échouée ({e}) → état segmentation vide.")
+                class_ids = None
+        else:
+            print("ℹ️  Enregistrement SANS YOLO → pas d'état segmentation baké.")
+
+        # 5. Bake du contrat de données §4 : scene.json + 3 .ply (même ordre)
+        bake_stats = bake_scene(
+            np.asarray(pcd.points),
+            (np.asarray(pcd.colors) * 255.0).astype(np.uint8) if pcd.has_colors()
+                else np.full((len(pcd.points), 3), 200, np.uint8),
+            normals=np.asarray(pcd.normals) if pcd.has_normals() else None,
+            class_ids=class_ids,
+            taxonomy=Taxonomy(include_other=SEG_INCLUDE_OTHER),
+            angle_axis=ARROW_ANGLE_AXIS,
+            angle_threshold_deg=ARROW_ANGLE_DEG_THRESHOLD,
+            obstacle_dim=OBSTACLE_DIM,
+            max_points=MAX_POINTS,
+            recenter=RECENTER,
+            out_dir=log_dir,
+        )
+        stats.update({f"bake_{k}": v for k, v in bake_stats.items()})
+        print(f"🎬 Scène bakée (§4) → {bake_stats['scene_dir']}/  "
+              f"({bake_stats['n_points']:,} pts, {bake_stats['n_labels']} labels, "
+              f"{bake_stats['scene_json_mb']} MB)")
+
+        # 6. Assets §11 : rgb.png + depth.png (frame représentative médiane)
+        self.save_preview_assets(log_dir)
+
+        # 7. Logs
         self.save_logs(log_dir, record_duration, stats, t_normals)
 
         # Libérer la mémoire des frames enregistrées
@@ -714,6 +883,30 @@ class Record3DRecorder:
 
         print(f"\n✅ Pipeline terminé. Voir : {log_dir}/")
         print(f"   → Visualiser : python view_ply.py {ply_path}")
+        print(f"   → Web (§4)   : {log_dir}/scene/scene.json")
+
+    # ── Assets §11 (rgb.png + depth.png) ──────────────────────────────────────
+    def save_preview_assets(self, log_dir):
+        """Sauve une frame RGB + sa depth colorisée (assets §11, états 2/3)."""
+        frames = self.recorded_frames
+        if not frames:
+            return
+        mid = len(frames) // 2
+        rgb = frames[mid]['rgb']
+        depth = frames[mid]['depth']
+        cv2.imwrite(os.path.join(log_dir, "rgb.png"),
+                    cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        d = depth.astype(np.float32)
+        valid = (d > 0) & (d < MAX_DEPTH)
+        dn = np.zeros_like(d)
+        if valid.any():
+            lo, hi = d[valid].min(), d[valid].max()
+            dn[valid] = (d[valid] - lo) / max(hi - lo, 1e-6)
+        depth_vis = (dn * 255).astype(np.uint8)
+        depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_TURBO)
+        depth_vis[~valid] = 0
+        cv2.imwrite(os.path.join(log_dir, "depth.png"), depth_vis)
+        print(f"🖼️  Assets §11 → {log_dir}/rgb.png  + depth.png")
     # ── Sauvegarde / chargement d'un recording brut (pour benchmark) ────────────
 
     def save_raw_recording(self, path):
@@ -747,8 +940,22 @@ class Record3DRecorder:
             depths=depths, rgbs=rgbs, intrinsics=intrinsics,
             confidences=confidences, has_confidence=np.array([has_conf]),
             poses=poses,
+            # Guardrail : intent YOLO verrouillé de l'enregistrement (with/without).
+            yolo_enabled=np.array([bool(self.yolo_locked)]),
         )
-        print(f"💾 Recording brut sauvegardé → {path}  ({len(frames)} frames)")
+        print(f"💾 Recording brut sauvegardé → {path}  ({len(frames)} frames, "
+              f"yolo={'on' if self.yolo_locked else 'off'})")
+
+    @staticmethod
+    def read_yolo_flag(path):
+        """Lit l'intent YOLO stocké dans un .npz (False si absent → compat)."""
+        try:
+            data = np.load(path, allow_pickle=False)
+            if 'yolo_enabled' in data:
+                return bool(data['yolo_enabled'][0])
+        except Exception:
+            pass
+        return False
 
     @staticmethod
     def load_raw_recording(path):
@@ -794,8 +1001,9 @@ class Record3DRecorder:
         self.session.connect(devices[0])
 
         print("🎬 Flux prêt. Appuie sur ⏺ dans Record3D pour démarrer.")
-        print("   [ESPACE] → démarrer/arrêter l'enregistrement   [Q/ESC] → quitter")
+        print("   [ESPACE] → enregistrer   [Y] → overlay YOLO (hors enregistrement)   [Q/ESC] → quitter")
 
+        seg_warned = False
         while not self.stream_stopped.is_set():
             self.new_frame_evt.wait(timeout=0.05)
             self.new_frame_evt.clear()
@@ -806,8 +1014,21 @@ class Record3DRecorder:
             if rgb is None:
                 continue
 
-            # ── Preview 2D ────────────────────────────────────────────────
+            # ── Overlay YOLO live : uniquement HORS enregistrement (guardrail) ──
+            # Pendant l'enregistrement, l'intent YOLO est figé : pas d'inférence
+            # live (préserve le FPS de capture), juste un indicateur "LOCKED".
+            run_overlay = self.yolo_enabled and not self.recording
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            if run_overlay:
+                try:
+                    seg = self.get_segmenter()
+                    bgr = seg.overlay(bgr, seg.infer(rgb))
+                except Exception as e:
+                    if not seg_warned:
+                        print(f"⚠️  Overlay YOLO indisponible ({e}) → flux RGB brut.")
+                        seg_warned = True
+
+            # ── Preview 2D ────────────────────────────────────────────────
             h, w = bgr.shape[:2]
             if w > PREVIEW_W:
                 bgr = cv2.resize(bgr, (PREVIEW_W, int(PREVIEW_W * h / w)))
@@ -822,9 +1043,17 @@ class Record3DRecorder:
                             (50, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 cv2.putText(bgr, "[ESPACE] Arreter l'enregistrement",
                             (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+                lock_txt = f"YOLO {'ON' if self.yolo_locked else 'OFF'}  [LOCKED]"
+                lock_col = (80, 220, 80) if self.yolo_locked else (160, 160, 160)
+                cv2.putText(bgr, lock_txt, (10, 95),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, lock_col, 2)
             else:
                 cv2.putText(bgr, "[ESPACE] Enregistrer   [Q/ESC] Quitter",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 100), 2)
+                yolo_txt = f"YOLO {'ON' if self.yolo_enabled else 'OFF'}   [Y] toggle"
+                yolo_col = (80, 220, 80) if self.yolo_enabled else (200, 200, 200)
+                cv2.putText(bgr, yolo_txt, (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, yolo_col, 2)
 
             cv2.imshow("Record3D – Enregistrement", bgr)
             key = cv2.waitKey(1) & 0xFF
@@ -836,6 +1065,14 @@ class Record3DRecorder:
                     self.process_recording(record_duration, save_npz=save_npz)
                 print("Sortie demandée.")
                 break
+
+            if key == ord('y'):
+                if self.recording:
+                    # Guardrail : interdit de changer l'intent YOLO en cours d'enreg.
+                    print("🔒 YOLO verrouillé pendant l'enregistrement (guardrail). Ignoré.")
+                else:
+                    self.yolo_enabled = not self.yolo_enabled
+                    print(f"🧠 Overlay YOLO live : {'ON' if self.yolo_enabled else 'OFF'}")
 
             if key == 32:  # ESPACE
                 if not self.recording:
@@ -875,11 +1112,30 @@ if __name__ == "__main__":
         default=False,
         help="Sauvegarder le recording brut en logs/<datetime>/scan.npz",
     )
+    parser.add_argument(
+        "--yolo", dest="yolo", action="store_true", default=None,
+        help="Forcer la segmentation YOLO ON (overlay live + bake segmentation).",
+    )
+    parser.add_argument(
+        "--no-yolo", dest="yolo", action="store_false",
+        help="Forcer la segmentation YOLO OFF.",
+    )
+    parser.add_argument(
+        "--max-points", type=int, default=None,
+        help=f"Budget de points du nuage baké (défaut: {MAX_POINTS}).",
+    )
     args = parser.parse_args()
 
     load_hyperparams_from_yaml(args.config)
+    if args.max_points is not None:
+        MAX_POINTS = args.max_points
 
     recorder = Record3DRecorder()
+    # --yolo / --no-yolo surchargent le défaut SEG_ENABLED de l'overlay live.
+    if args.yolo is not None:
+        recorder.yolo_enabled = bool(args.yolo)
+        recorder.yolo_locked  = bool(args.yolo)
+
     if args.from_npz:
         npz_path = args.from_npz
         if not os.path.exists(npz_path):
@@ -888,8 +1144,17 @@ if __name__ == "__main__":
 
         print(f"📦 Reconstruction depuis NPZ : {npz_path}")
         recorder.recorded_frames = Record3DRecorder.load_raw_recording(npz_path)
+        # Intent YOLO : priorité au flag CLI, sinon celui stocké dans le .npz.
+        if args.yolo is None:
+            recorder.yolo_locked = Record3DRecorder.read_yolo_flag(npz_path)
+        print(f"🧠 Segmentation pour ce bake : "
+              f"{'ON' if recorder.yolo_locked else 'OFF'}")
         out_dir = make_reconstruct_output_dir(npz_path)
         print(f"📁 Dossier de sortie : {out_dir}")
         recorder.process_recording(record_duration=0.0, save_npz=False, output_dir=out_dir)
     else:
+        if Record3DStream is None:
+            print("❌ record3d non installé — capture live impossible sur cette machine.")
+            print("   → Branche l'iPhone sur le Mac, ou utilise --from-npz pour le bake offline.")
+            raise SystemExit(1)
         recorder.run(save_npz=args.save_npz)
